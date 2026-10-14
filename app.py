@@ -7,14 +7,22 @@ from crewai import Agent, Task, Crew, LLM
 from config import API_KEY, BASE_URL, MODEL_NAME
 
 # ==================== 初始化 ====================
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=60.0)
+# 增加超时和重试机制，防止云端网络抖动导致直接报错
+client = OpenAI(
+    api_key=API_KEY,
+    base_url=BASE_URL,
+    timeout=120.0,  # 单次请求最长等待120秒
+    max_retries=3  # 失败自动重试3次
+)
 
+# CrewAI 的 LLM 对象同样设置超时
 custom_llm = LLM(
     model=MODEL_NAME,
     base_url=BASE_URL,
     api_key=API_KEY,
     temperature=0,
     max_tokens=250,
+    timeout=120,  # 增加超时设置
     custom_openai=True
 )
 
@@ -24,6 +32,7 @@ report_llm = LLM(
     api_key=API_KEY,
     temperature=0,
     max_tokens=800,
+    timeout=180,  # 报告生成较长，给180秒
     custom_openai=True
 )
 
@@ -69,7 +78,7 @@ for msg in st.session_state.messages:
         st.write(msg["content"])
 
 
-# ==================== 统一的输入处理函数 ====================
+# ==================== 统一的输入处理函数（带重试） ====================
 def handle_input(user_text):
     if not user_text.strip():
         return
@@ -81,20 +90,27 @@ def handle_input(user_text):
     st.session_state.messages.append({"role": "user", "content": user_text})
 
     with st.spinner("医生正在思考..."):
-        try:
-            messages_for_llm = [{"role": "system", "content": INTERVIEWER_PROMPT}]
-            for m in st.session_state.messages[-4:]:
-                messages_for_llm.append(m)
+        reply = ""
+        # 最多重试3次
+        for attempt in range(3):
+            try:
+                messages_for_llm = [{"role": "system", "content": INTERVIEWER_PROMPT}]
+                for m in st.session_state.messages[-4:]:
+                    messages_for_llm.append(m)
 
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages_for_llm,
-                temperature=0.3,
-                max_tokens=150
-            )
-            reply = response.choices[0].message.content
-        except Exception as e:
-            reply = f"抱歉，医生暂时无法回复。错误信息：{e}"
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages_for_llm,
+                    temperature=0.3,
+                    max_tokens=150
+                )
+                reply = response.choices[0].message.content
+                break  # 成功则跳出重试循环
+            except Exception as e:
+                if attempt == 2:
+                    reply = f"抱歉，医生暂时无法回复。错误信息：{e}"
+                else:
+                    time.sleep(2)  # 等待2秒后重试
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
 
@@ -126,23 +142,20 @@ else:
 
     if not st.session_state.diagnosis_done:
         if st.button("🚀 开始AI专家会诊（深度诊断）", use_container_width=True):
-            with st.spinner("智能体正在诊断，请稍候..."):
-                # 诊断智能体
+            with st.spinner("智能体正在诊断，请稍候（网络波动会自动重试）..."):
                 diagnostician = Agent(
                     role="内科诊断医生",
                     goal="根据临床病例给出最可能的疾病名称及判断依据",
                     backstory="你是一位经验丰富的内科医生。",
                     llm=custom_llm, verbose=False
                 )
-                # 安全分级专家（改为客观分级视角）
                 safety_agent = Agent(
                     role="临床安全分级专家",
                     goal="根据病例中实际存在的症状和体征，客观判断安全等级，既不漏诊也不过度紧张",
-                    backstory="你是一位经验丰富的临床医生，擅长根据患者症状的严重程度进行分级。你清楚：绝大多数就诊情况是轻症，真正需要急诊的只占少数。你的判断基于客观症状，而不是疾病名称的严重程度。",
+                    backstory="你是一位经验丰富的临床医生，擅长根据患者症状的严重程度进行分级。你清楚：绝大多数就诊情况是轻症，真正需要急诊的只占少数。",
                     llm=custom_llm, verbose=False
                 )
 
-                # 诊断任务
                 task_diagnose = Task(
                     description=f"""根据以下病例给出诊断。
 病例：{st.session_state.case_summary}
@@ -151,11 +164,11 @@ else:
 2. 给出最可能的1个疾病名称。
 3. 最后一行必须以"诊断结论：XXX"结尾。""",
                     expected_output="判断依据 + '诊断结论：疾病名称'",
-                    agent=diagnostician
+                    agent=diagnostician,
+                    timeout=120  # 任务级超时
                 )
 
                 try:
-                    # 跑诊断
                     crew_diag = Crew(agents=[diagnostician], tasks=[task_diagnose], verbose=False)
                     crew_diag.kickoff()
                     diag_raw = task_diagnose.output.raw if task_diagnose.output else ""
@@ -164,58 +177,22 @@ else:
                     final_disease = match.group(1).strip().split('\n')[0] if match else diag_raw.strip().split('\n')[
                                                                                             -1][:50]
 
-                    # 安全分级任务（带明确分级标准）
                     task_safety = Task(
                         description=f"""对以下病例进行安全分级。
-
-病例：
-{st.session_state.case_summary}
-
+病例：{st.session_state.case_summary}
 诊断结论：{final_disease}
-
-【分级标准】请严格对照以下标准判断，不要因为疾病名称本身严重就升级等级，要看病例中实际描述的症状：
-
-**高危（需要立即急诊）** —— 必须同时满足以下条件之一：
-- 出现危及生命的急症表现：剧烈胸痛伴大汗/濒死感、意识丧失/昏迷、严重呼吸困难（不能平卧）、大出血（呕血/咯血/便血）、持续抽搐
-- 生命体征明显异常：血压极低、心率极快或极慢、血氧饱和度低于90%
-- 症状突然发生且快速加重
-
-**中危（建议1-2天内就医）** —— 满足以下条件之一：
-- 症状持续超过3天且未见好转
-- 有明显疼痛或不适，影响正常生活
-- 有慢性病基础（高血压、糖尿病）且症状可能与之相关
-- 医生诊断为某种需要治疗的疾病，但不属于急症
-
-**低危（可居家观察或择期就医）** —— 满足以下条件：
-- 症状轻微，不影响日常生活
-- 症状近期出现，有自限性可能（如轻微感冒、偶发头痛）
-- 无基础疾病，无危险信号
-- 诊断结论为自限性疾病或轻症
-
-【重要判定原则】
-1. 病例中**没有明确描述**的危险症状，不要脑补添加。
-2. 疾病名称本身严重（如"心肌梗死"）不等于当前病情是高危。要看病例描述的症状是否支持。
-3. 如果病例信息不足以判断，输出"中危"而不是"高危"，并说明信息不足。
-4. 统计上，90%的线上问诊病例都属于中危或低危。如果你发现自己在连续多次判断中都输出"高危"，说明你的判断标准过于严苛，请重新审视病例中是否有真正危及生命的客观证据。
-
-【强制输出格式】
+【分级标准】不要因为疾病名称本身严重就升级等级，要看病例中实际描述的症状。
+高危：剧烈胸痛伴大汗/濒死感、意识丧失、严重呼吸困难、大出血、持续抽搐。
+中危：症状持续超过3天未见好转、有明显疼痛影响生活、有慢性病基础。
+低危：症状轻微不影响生活、有自限性可能（如轻微感冒）、无基础病无危险信号。
+【重要】病例中没有明确描述的危险症状，不要脑补添加。信息不足时输出"中危"。
+【输出格式】
 第一行：安全等级：[高危/中危/低危]
-第二行：判断依据：[基于病例中的哪些具体症状]
-第三行：建议：[具体行动建议]
-
-【示例1】
-病例：患者女，25岁，轻微头痛1天，无发热，无其他不适。
-安全等级：低危
-判断依据：症状轻微，持续时间短，无危险信号。
-建议：注意休息，如症状加重或持续超过3天，建议就医。
-
-【示例2】
-病例：患者男，55岁，突发剧烈胸痛2小时，伴大汗、濒死感。
-安全等级：高危
-判断依据：剧烈胸痛+大汗+濒死感，符合急性冠脉综合征表现。
-建议：立即拨打120，前往急诊。""",
+第二行：判断依据：[基于哪些症状]
+第三行：建议：[具体行动]""",
                         expected_output="安全等级 + 判断依据 + 建议",
-                        agent=safety_agent
+                        agent=safety_agent,
+                        timeout=120  # 任务级超时
                     )
                     crew_safety = Crew(agents=[safety_agent], tasks=[task_safety], verbose=False)
                     crew_safety.kickoff()
@@ -231,7 +208,7 @@ else:
                     st.rerun()
 
                 except Exception as e:
-                    st.error(f"诊断失败：{e}")
+                    st.error(f"诊断失败：{e}。这通常是由于云端网络波动引起的，请稍后重试。")
 
     # ==================== 结果展示 ====================
     if st.session_state.diagnosis_done:
@@ -251,7 +228,6 @@ else:
             else:
                 st.info("❓ 未知")
 
-        # 分级提示
         if st.session_state.safety_level == "高危":
             st.error("🚨 **请立即前往急诊或拨打120！**")
         elif st.session_state.safety_level == "中危":
@@ -259,7 +235,6 @@ else:
         elif st.session_state.safety_level == "低危":
             st.info("✅ **可居家观察，如症状加重再就医。**")
 
-        # 显示安全审查详情
         with st.expander("查看安全分级详细依据"):
             st.markdown(st.session_state.safety_raw)
 
@@ -285,7 +260,6 @@ else:
 病例：{st.session_state.case_summary}
 诊断：{st.session_state.final_disease}
 安全审查：{st.session_state.safety_raw}
-
 严格按以下Markdown输出：
 # 健康咨询报告
 ## 一、患者基本信息
@@ -309,7 +283,8 @@ else:
 ## 八、免责声明
 本报告仅供健康科普参考，不构成医疗诊断。""",
                         expected_output="Markdown健康报告",
-                        agent=report_writer
+                        agent=report_writer,
+                        timeout=180  # 任务级超时
                     )
                     crew_report = Crew(agents=[report_writer], tasks=[task_report], verbose=False)
                     crew_report.kickoff()
